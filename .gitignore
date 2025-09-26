@@ -1,0 +1,5 @@
+.env
+package-lock.json
+node_modules
+suggestions.json
+json.sqlite
