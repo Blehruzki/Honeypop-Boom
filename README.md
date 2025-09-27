@@ -6,7 +6,7 @@ Simple bot for trapping and banning discord spammers
 **/set-log #channel** - set the channel you want to use for logs  
 **/show-config** - show current honeypot configuration  
 **/whitelist-add** - add a role to the whitelist (members with this role will NOT be banned)  
-**/whitelist-remove** - remove a role from the whitelist.
+**/whitelist-remove** - remove a role from the whitelist.  
 **/set-delete** - enables deleting messages in the honeypot channel *(enabled by default)*
 
 # (WIP) How to set up
