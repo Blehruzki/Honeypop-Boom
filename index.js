@@ -41,11 +41,18 @@ function saveConfig(cfg) {
   fs.renameSync(tmp, CONFIG_PATH);
 }
 
-let CONFIG = loadConfig(); // { [guildId]: { honeypotChannelId, logChannelId, whitelistRoleIds: [] } }
+let CONFIG = loadConfig(); // { [guildId]: { honeypotChannelId, logChannelId, whitelistRoleIds: [], deleteMessage: true } }
 
 function getGuildConfig(gid) {
   if (!CONFIG[gid]) {
-    CONFIG[gid] = { honeypotChannelId: null, logChannelId: null, whitelistRoleIds: [] };
+    CONFIG[gid] = { 
+		honeypotChannelId: null, 
+		logChannelId: null, 
+		whitelistRoleIds: [],
+		deleteMessage: true, //NEW: default on
+	};
+  } else if (typeof CONFIG[gid].deleteMessage === 'undefined') {
+    CONFIG[gid].deleteMessage = true; // backfill old installs
   }
   return CONFIG[gid];
 }
@@ -56,12 +63,12 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.GuildMembers,   // needed for role checks
-    GatewayIntentBits.MessageContent, // optional but useful
+    GatewayIntentBits.MessageContent, // optional but useful for auditing
   ],
   partials: [Partials.Message, Partials.Channel, Partials.GuildMember],
 });
 
-// ---- Commands (guild-scoped, auto-registered) ----
+// ---- Slash Commands (guild-scoped, auto-registered) ----
 const MANAGE_GUILD = PermissionsBitField.Flags.ManageGuild.toString();
 
 const COMMANDS = [
@@ -124,6 +131,20 @@ const COMMANDS = [
     ],
   },
   {
+	name: 'set-delete',
+    description: 'Enable/disable deleting the spam message on trigger.',
+    default_member_permissions: MANAGE_GUILD,
+    dm_permission: false,
+    options: [
+      {
+        name: 'enabled',
+        description: 'true = delete message; false = do not delete',
+        type: ApplicationCommandOptionType.Boolean,
+        required: true,
+      },
+    ],
+  },
+  {	   
     name: 'show-config',
     description: 'Show current honeypot configuration.',
     default_member_permissions: MANAGE_GUILD,
@@ -159,6 +180,7 @@ function isWhitelisted(member, guildCfg) {
   // Exempt admins & guild managers
   if (member.permissions.has(PermissionsBitField.Flags.Administrator) ||
       member.permissions.has(PermissionsBitField.Flags.ManageGuild)) {
+	 
     return true;
   }
   // Exempt whitelisted roles
@@ -167,22 +189,30 @@ function isWhitelisted(member, guildCfg) {
 }
 
 async function auditLog(guild, payload) {
-  const { userTag, userId, channelName, channelId, action, reason } = payload;
+  const { userTag, userId, channelName, channelId, action, reason, snapshot } = payload;
   try {
     const cfg = getGuildConfig(guild.id);
     if (!cfg.logChannelId) return;
     const ch = await guild.channels.fetch(cfg.logChannelId).catch(() => null);
     if (!ch || !ch.isTextBased()) return;
+
+    const fields = [
+      { name: 'Action', value: action ?? '—', inline: true },
+      { name: 'User', value: `${userTag} (${userId})`, inline: true },
+      { name: 'Channel', value: `${channelName} (${channelId})`, inline: true },
+      { name: 'Reason', value: reason ?? '—' },
+    ];
+    if (snapshot) {
+      // Include a short preview of message content if available
+      const trimmed = snapshot.length > 900 ? snapshot.slice(0, 900) + '…' : snapshot;
+      fields.push({ name: 'Message snapshot', value: trimmed });
+    }
+
     await ch.send({
       embeds: [
         {
           title: 'Honeypot',
-          fields: [
-            { name: 'Action', value: action ?? '—', inline: true },
-            { name: 'User', value: `${userTag} (${userId})`, inline: true },
-            { name: 'Channel', value: `${channelName} (${channelId})`, inline: true },
-            { name: 'Reason', value: reason ?? '—' },
-          ],
+          fields,
           timestamp: new Date().toISOString(),
         },
       ],
@@ -231,15 +261,19 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.reply({ content: `✅ Removed from whitelist: <@&${role.id}>`, ephemeral: true });
         break;
       }
+		case 'set-delete': {
+        const enabled = interaction.options.getBoolean('enabled', true);
+        cfg.deleteMessage = enabled;
+        saveConfig(CONFIG);
+        await interaction.reply({ content: `✅ Delete-on-trigger is now **${enabled ? 'ENABLED' : 'DISABLED'}**`, ephemeral: true });
+        break;
+      }
       case 'show-config': {
         const lines = [
           `**Honeypot:** ${cfg.honeypotChannelId ? `<#${cfg.honeypotChannelId}>` : 'not set'}`,
           `**Log:** ${cfg.logChannelId ? `<#${cfg.logChannelId}>` : 'not set'}`,
-          `**Whitelist roles:** ${
-            cfg.whitelistRoleIds?.length
-              ? cfg.whitelistRoleIds.map((r) => `<@&${r}>`).join(', ')
-              : 'none'
-          }`,
+          `**Whitelist roles:** ${cfg.whitelistRoleIds?.length ? cfg.whitelistRoleIds.map((r) => `<@&${r}>`).join(', ') : 'none'}`,
+          `**Delete on trigger:** ${cfg.deleteMessage ? 'enabled' : 'disabled'}`,
         ];
         await interaction.reply({ content: lines.join('\n'), ephemeral: true });
         break;
@@ -275,6 +309,20 @@ client.on('messageCreate', async (message) => {
     }
 
     const me = message.guild.members.me;
+
+    // 1) Delete message if enabled and permitted
+    let deleted = false;
+    let snapshot = null;
+    if (cfg.deleteMessage) {
+      // capture a snapshot of content (if intent enabled) for auditing before deletion
+      snapshot = (message.content || '').trim();
+      const canDelete = me.permissionsIn(message.channel).has(PermissionsBitField.Flags.ManageMessages);
+      if (canDelete) {
+        await message.delete().then(() => { deleted = true; }).catch(() => {});
+      }
+    }
+
+    // 2) Check ban permission & role hierarchy
     if (!me.permissions.has(PermissionsBitField.Flags.BanMembers)) {
       await auditLog(message.guild, {
         userTag: message.author.tag,
@@ -283,6 +331,7 @@ client.on('messageCreate', async (message) => {
         channelId: message.channel.id,
         action: 'FAILED',
         reason: 'Bot lacks Ban Members permission',
+		snapshot,
       });
       return;
     }
@@ -297,6 +346,7 @@ client.on('messageCreate', async (message) => {
         channelId: message.channel.id,
         action: 'FAILED',
         reason: 'Bot role is not high enough to ban this user',
+		snapshot,
       });
       return;
     }
@@ -304,13 +354,15 @@ client.on('messageCreate', async (message) => {
     // Ban user
     const reason = `Posted in honeypot channel (${message.channel.id})`;
     await message.guild.members.ban(message.author.id, { reason });
+
     await auditLog(message.guild, {
       userTag: message.author.tag,
       userId: message.author.id,
       channelName: message.channel.name,
       channelId: message.channel.id,
-      action: 'BANNED',
+       action: `BANNED${deleted ? ' & MESSAGE DELETED' : ''}`,
       reason,
+      snapshot,
     });
   } catch (err) {
     console.error('messageCreate handler error:', err);
